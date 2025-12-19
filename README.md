@@ -10,9 +10,10 @@ Quantifying and controlling geometric and electronic information content in data
 ```
 Filenames follow the same formating:
 `X_$REP_$STATE.npy`
+
 where:
-- $REP in [spahm-a, spahm-b, spahm-a-global, spahm-b-global, slatm]
-- $STATE in [neutral, vertical, relaxed]
+- `$REP` is one of [spahm-a, spahm-b, spahm-a-global, spahm-b-global, slatm]
+- `$STATE` is one of [neutral, vertical, relaxed]
 
 
 ## Some reference papers
