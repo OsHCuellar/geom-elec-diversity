@@ -1368,113 +1368,151 @@ def precompute_features_with_slices_and_extra(
     extra_block_mats=None,
 ):
     """
-    Like precompute_features_with_slices, but you can append extra descriptor
-    blocks (e.g. SLATM, Coulomb matrix) that live at the same level as
-    'geom_all' and 'elec_all'.
+    Build core descriptor using feature_fn(mol), then append extra precomputed
+    descriptor blocks (SLATM, CM, etc.) with safe slice bookkeeping.
 
-    Inputs
-    ------
-    mol_list        : list of PySCF Mole objects, length N
-    feature_fn      : function(mol) -> 1D array of geom+elec features
-                      (same as before, usually make_feature_fn_geom_*_elec)
-    geom_blocks     : tuple/list of geometry block names, in order
-    elec_blocks     : tuple/list of electronic block names, in order
-    extra_block_mats: dict name -> array, optional
-                      each array has shape (N_samples, D_block),
-                      where rows are in the SAME order as mol_list.
-
-                      Example:
-                        {
-                          'slatm': slatm_matrix,      # (N, D_slatm)
-                          'coulomb': cm_matrix,       # (N, D_cm)
-                        }
+    IMPORTANT robustness:
+    - If feature_fn returns MORE dims than implied by (geom_blocks + elec_blocks),
+      and elec_blocks is empty, we TRIM X_core to the requested geom dims.
+      (This matches the common use-case: "use geom only" even if feature_fn
+       always returns geom+elec.)
+    - If elec_blocks is non-empty and there is a mismatch, we raise, because
+      we cannot safely infer where the electronic blocks live.
 
     Returns
     -------
-    X_all       : (N_samples, D_total) full feature matrix
-                  [geom blocks | elec blocks | extra blocks]
-    block_slices: dict mapping block_name -> slice in columns of X_all.
-                  Includes:
-                    - all individual geom blocks
-                    - all individual elec blocks
-                    - 'geom_all'
-                    - 'elec_all'
-                    - each extra block name
-                    - 'extra_all' (all extra descriptors concatenated)
-                    - 'core_all' (geom+elec only, no extras)
-                    - 'all' (everything: geom + elec + extras)
+    X_all : (N, D_total)
+    block_slices : dict[str, slice]
+        Includes:
+          - each geom block
+          - each elec block (if any)
+          - 'geom_all', 'elec_all', 'core_all'
+          - each extra block
+          - 'extra_all' (if extras)
+          - 'all'
     """
+    import numpy as np
+
     mol_list = list(mol_list)
     N = len(mol_list)
 
-    # 1) core geom+elec features, exactly as in your old function
+    if extra_block_mats is None:
+        extra_block_mats = {}
+
+    geom_blocks = tuple(geom_blocks)
+    elec_blocks = tuple(elec_blocks)
+
+    # -----------------------------
+    # 1) Build core matrix
+    # -----------------------------
     X_rows = []
     for mol in mol_list:
-        xi = feature_fn(mol)          # full geom+elec descriptor
+        xi = feature_fn(mol)
         xi = np.asarray(xi, float).ravel()
         X_rows.append(xi)
-    X_core = np.vstack(X_rows)        # (N, D_core)
 
+    X_core = np.vstack(X_rows) if X_rows else np.zeros((N, 0), float)
+
+    # -----------------------------
+    # 2) Compute requested core dims from block sizes
+    # -----------------------------
     block_slices = {}
     offset = 0
 
-    # geometry blocks first
     for b in geom_blocks:
         size = GEOM_BLOCK_SIZES[b]
         block_slices[b] = slice(offset, offset + size)
         offset += size
     geom_total_dim = offset
 
-    # then electronic blocks
     for b in elec_blocks:
         size = GUESS_ELEC_BLOCK_SIZES[b]
         block_slices[b] = slice(offset, offset + size)
         offset += size
     elec_total_dim = offset - geom_total_dim
 
-    core_total_dim = offset
+    requested_core_dim = offset
 
-    # meta slices for core
-    block_slices['geom_all'] = slice(0, geom_total_dim)
-    block_slices['elec_all'] = slice(geom_total_dim,
-                                     geom_total_dim + elec_total_dim)
-    block_slices['core_all'] = slice(0, core_total_dim)
+    # -----------------------------
+    # 3) Robust handling of mismatches
+    # -----------------------------
+    if X_core.shape[1] < requested_core_dim:
+        raise ValueError(
+            f"Core feature dim mismatch: feature_fn returned {X_core.shape[1]} dims, "
+            f"but requested blocks imply {requested_core_dim} dims "
+            f"(= geom {geom_total_dim} + elec {elec_total_dim})."
+        )
 
-    # 2) append extra descriptor blocks (SLATM, CM, etc.)
+    if X_core.shape[1] != requested_core_dim:
+        # feature_fn returned EXTRA dims beyond what caller requested
+        if len(elec_blocks) == 0:
+            # Common use-case: feature_fn returns geom+elec, but caller wants geom only
+            # -> trim to geom_total_dim (requested_core_dim == geom_total_dim here)
+            X_core = X_core[:, :requested_core_dim]
+        else:
+            # Caller asked for specific electronic blocks; we cannot safely infer layout
+            raise ValueError(
+                f"Core feature dim mismatch: feature_fn returned {X_core.shape[1]} dims, "
+                f"but requested blocks imply {requested_core_dim} dims "
+                f"(= geom {geom_total_dim} + elec {elec_total_dim}). "
+                "Because elec_blocks is non-empty, trimming is unsafe. "
+                "Construct feature_fn to match the requested geom_blocks/elec_blocks."
+            )
+
+    core_total_dim = requested_core_dim  # after trimming, this is correct
+
+    # Meta slices for core
+    block_slices["geom_all"] = slice(0, geom_total_dim)
+    block_slices["elec_all"] = slice(geom_total_dim, geom_total_dim + elec_total_dim)
+    block_slices["core_all"] = slice(0, core_total_dim)
+
+    # -----------------------------
+    # 4) Append extras with validated slices
+    # -----------------------------
+    extra_refs = {}   # always defined
     extra_cols = []
     extra_start = core_total_dim
     extra_total_dim = 0
 
-    if extra_block_mats is not None:
-        for name, mat in extra_block_mats.items():
-            mat = np.asarray(mat, float)
-            if mat.shape[0] != N:
-                raise ValueError(
-                    f"Extra block '{name}' has {mat.shape[0]} rows but "
-                    f"mol_list has {N}"
-                )
-            D_block = mat.shape[1]
+    offset = core_total_dim  # extras start after core
 
-            # slice for this extra block in the final X_all
-            block_slices[name] = slice(offset, offset + D_block)
-            offset += D_block
-            extra_total_dim += D_block
+    for name, mat in extra_block_mats.items():
+        mat = np.asarray(mat, float)
+        if mat.ndim != 2:
+            raise ValueError(f"Extra block '{name}' must be 2D (N, D); got shape {mat.shape}")
+        if mat.shape[0] != N:
+            raise ValueError(
+                f"Extra block '{name}' has {mat.shape[0]} rows but mol_list has {N}"
+            )
 
-            extra_cols.append(mat)
+        D_block = mat.shape[1]
+        block_slices[name] = slice(offset, offset + D_block)
+        offset += D_block
 
-    # build final X_all
+        extra_cols.append(mat)
+        extra_refs[name] = mat
+        extra_total_dim += D_block
+
+    # Final assembly
     if extra_cols:
         X_all = np.hstack([X_core] + extra_cols)
-        # meta slice for all extra blocks together
-        block_slices['extra_all'] = slice(extra_start,
-                                          extra_start + extra_total_dim)
+        block_slices["extra_all"] = slice(extra_start, extra_start + extra_total_dim)
     else:
         X_all = X_core
 
-    # final meta slice: everything
-    block_slices['all'] = slice(0, offset)
+    block_slices["all"] = slice(0, X_all.shape[1])
+
+    # Validate extras to prevent silent slice bugs
+    if extra_refs:
+        _assert_block_slice_consistency(X_all, block_slices, extra_refs)
 
     return X_all, block_slices
+
+
+
+
+
+
 
 def col_indices_for_blocks(block_slices, block_names):
     """Return a 1D array of column indices for a list of block names."""
@@ -1483,3 +1521,27 @@ def col_indices_for_blocks(block_slices, block_names):
         sl = block_slices[b]
         idx.extend(range(sl.start, sl.stop))
     return np.array(idx, dtype=int)
+
+def _assert_block_slice_consistency(X_all, block_slices, reference_blocks, atol=1e-12):
+    import numpy as np
+
+    for name, ref in reference_blocks.items():
+        if name not in block_slices:
+            raise KeyError(f"Block '{name}' missing from block_slices")
+
+        sl = block_slices[name]
+        Xb = X_all[:, sl]
+
+        if Xb.shape != ref.shape:
+            raise ValueError(
+                f"Block '{name}' shape mismatch: "
+                f"slice gives {Xb.shape}, reference is {ref.shape}"
+            )
+
+        diff = np.max(np.abs(Xb - ref))
+        if not np.isfinite(diff) or diff > atol:
+            raise ValueError(
+                f"Block '{name}' slice inconsistency: "
+                f"max|X_all[:, slice] - reference| = {diff}"
+            )
+
