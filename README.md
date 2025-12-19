@@ -2,6 +2,18 @@
 
 Quantifying and controlling geometric and electronic information content in datasets.
 
+## Representations (SPAHM(a,b), SLATM) location
+
+**All representations are available in the form of `.npy` array on `lcmdlc3` @**
+```bash
+/home/calvino/yannick/ENN-SPAHM/qm7/Xarray
+```
+Filenames follow the same formating:
+`X_$REP_$STATE.npy`
+where:
+- $REP in [spahm-a, spahm-b, spahm-a-global, spahm-b-global, slatm]
+- $STATE in [neutral, vertical, relaxed]
+
 
 ## Some reference papers
 
